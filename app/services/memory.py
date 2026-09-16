@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.conversation import Conversation
@@ -16,12 +16,20 @@ from app.schemas.analysis import ExtractedIssue
 OPEN_STATUSES = (IssueStatus.COLLECTING, IssueStatus.READY_FOR_BOOKING)
 
 
-def get_or_create_conversation(db: Session, conversation_id: Optional[str]) -> Conversation:
+class ConversationAccessError(Exception):
+    """Raised when `conversation_id` doesn't exist or belongs to a different
+    user. Deliberately the same error either way — confirming that a
+    conversation ID exists but belongs to someone else is itself a leak."""
+
+
+def get_or_create_conversation(db: Session, user_id: str, conversation_id: Optional[str]) -> Conversation:
     if conversation_id:
         existing = db.get(Conversation, conversation_id)
         if existing is not None:
+            if existing.user_id != user_id:
+                raise ConversationAccessError(conversation_id)
             return existing
-    conversation = Conversation()
+    conversation = Conversation(user_id=user_id)
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
@@ -46,12 +54,53 @@ def get_history(db: Session, conversation_id: str, limit: int = 40) -> list[Mess
     return list(db.scalars(stmt))
 
 
+def list_conversations_for_user(db: Session, user_id: str) -> list[Conversation]:
+    """Ordered most-recently-active first, like a chat history sidebar.
+    `Conversation.updated_at` only changes when the conversation row itself
+    is written (e.g. patient_name first set) — not on every new message — so
+    this orders by the latest message's timestamp instead, falling back to
+    the conversation's own created_at for the (practically nonexistent)
+    case of a conversation with no messages yet."""
+    latest_message = (
+        select(Message.conversation_id, func.max(Message.created_at).label("last_activity"))
+        .group_by(Message.conversation_id)
+        .subquery()
+    )
+    stmt = (
+        select(Conversation)
+        .outerjoin(latest_message, latest_message.c.conversation_id == Conversation.id)
+        .where(Conversation.user_id == user_id)
+        .order_by(func.coalesce(latest_message.c.last_activity, Conversation.created_at).desc())
+    )
+    return list(db.scalars(stmt))
+
+
+def get_first_user_message(db: Session, conversation_id: str) -> Optional[Message]:
+    stmt = (
+        select(Message)
+        .where(Message.conversation_id == conversation_id, Message.role == MessageRole.USER)
+        .order_by(Message.created_at.asc())
+        .limit(1)
+    )
+    return db.scalars(stmt).first()
+
+
 def get_open_issues(db: Session, conversation_id: str) -> list[Issue]:
     stmt = (
         select(Issue)
         .where(Issue.conversation_id == conversation_id, Issue.status.in_(OPEN_STATUSES))
         .order_by(Issue.created_at.asc())
     )
+    return list(db.scalars(stmt))
+
+
+def get_all_issues(db: Session, conversation_id: str) -> list[Issue]:
+    """Every issue ever raised in this conversation, regardless of status —
+    used to build the LLM's "known issues" context so an already-BOOKED
+    issue stays referenceable by issue_ref (e.g. for a reschedule request).
+    `get_open_issues` alone would make a booked issue invisible to the
+    model, which then has no id to reuse and creates a duplicate instead."""
+    stmt = select(Issue).where(Issue.conversation_id == conversation_id).order_by(Issue.created_at.asc())
     return list(db.scalars(stmt))
 
 

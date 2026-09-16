@@ -3,6 +3,7 @@ from app.models.conversation import Conversation
 from app.models.issue import Issue, IssueStatus
 from app.models.llm_request_log import LLMRequestLog
 from app.models.message import Message, MessageRole
+from app.models.user import User
 
 __all__ = [
     "Appointment",
@@ -12,4 +13,5 @@ __all__ = [
     "LLMRequestLog",
     "Message",
     "MessageRole",
+    "User",
 ]

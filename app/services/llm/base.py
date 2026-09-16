@@ -67,9 +67,22 @@ class StreamChunk(BaseModel):
 
 
 class ProviderError(Exception):
-    """Raised by a provider on any failure. LLMService treats this as
-    retryable/fallback-triggering — providers should not raise raw SDK
-    exceptions upward."""
+    """Raised by a provider on any failure. LLMService always treats this as
+    fallback-triggering; `retryable` additionally controls whether the SAME
+    provider/model is worth a second, backed-off attempt first.
+
+    `retryable=True` (default): transient failures — timeout, connection
+    error, 5xx, temporary overload — where a quick retry might succeed.
+    `retryable=False`: quota/auth/config problems (429 quota, 401, 403) that
+    will fail identically on retry, so LLMService skips straight to the next
+    candidate instead of wasting a retry + backoff on a doomed attempt.
+
+    Providers should never let raw SDK exceptions escape upward — always
+    wrap them in a ProviderError with the correct `retryable` value."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class LLMProvider(ABC):

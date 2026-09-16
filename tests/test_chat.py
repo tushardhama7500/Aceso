@@ -9,9 +9,11 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api.deps import get_current_user
 from app.config import Settings
 from app.db import get_db
 from app.main import app
+from app.services import user_service
 from app.services.agent import Agent, get_agent
 from app.services.llm.base import LLMResult, ToolCall
 from app.services.llm.service import LLMService
@@ -21,19 +23,27 @@ from tests.fakes import FakeProvider
 def _agent_with_responses(responses: list[LLMResult]) -> Agent:
     provider = FakeProvider(name="gemini", responses=responses)
     svc = LLMService.__new__(LLMService)
-    svc.settings = Settings(llm_provider="gemini", llm_fallback_provider=None)
+    svc.settings = Settings(llm_provider="gemini", llm_fallback_providers="")
     svc.primary_name = "gemini"
-    svc.fallback_name = None
+    svc.fallback_names = []
     svc._providers = {"gemini": provider}
     return Agent(svc)
 
 
 @pytest.fixture()
 def client(db_session):
+    """These tests exercise chat/booking behavior, not auth itself, so the
+    current-user dependency is overridden with a fixed test user rather than
+    requiring a real Authorization header on every request — see
+    test_auth.py / test_data_isolation.py for the real JWT flow."""
+
     def override_get_db():
         yield db_session
 
+    test_user = user_service.create_user(db_session, email="patient@example.com", password="testpassword123")
+
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = lambda: test_user
     try:
         yield TestClient(app)
     finally:

@@ -2,25 +2,38 @@
 merging, independent of the Agent/LLM."""
 from __future__ import annotations
 
+import pytest
+
 from app.models.issue import IssueStatus
 from app.models.message import MessageRole
 from app.schemas.analysis import ExtractedIssue
 from app.services import memory
 
 
-def test_get_or_create_conversation_creates_when_missing(db_session):
-    conv = memory.get_or_create_conversation(db_session, None)
+def test_get_or_create_conversation_creates_when_missing(db_session, test_user):
+    conv = memory.get_or_create_conversation(db_session, test_user.id, None)
     assert conv.id.startswith("conv_")
+    assert conv.user_id == test_user.id
 
 
-def test_get_or_create_conversation_reuses_existing(db_session):
-    conv = memory.get_or_create_conversation(db_session, None)
-    same = memory.get_or_create_conversation(db_session, conv.id)
+def test_get_or_create_conversation_reuses_existing(db_session, test_user):
+    conv = memory.get_or_create_conversation(db_session, test_user.id, None)
+    same = memory.get_or_create_conversation(db_session, test_user.id, conv.id)
     assert same.id == conv.id
 
 
-def test_messages_persist_and_are_retrievable_in_order(db_session):
-    conv = memory.get_or_create_conversation(db_session, None)
+def test_get_or_create_conversation_rejects_another_users_conversation(db_session, test_user):
+    from app.services import user_service
+
+    conv = memory.get_or_create_conversation(db_session, test_user.id, None)
+    other_user = user_service.create_user(db_session, email="other@example.com", password="testpassword123")
+
+    with pytest.raises(memory.ConversationAccessError):
+        memory.get_or_create_conversation(db_session, other_user.id, conv.id)
+
+
+def test_messages_persist_and_are_retrievable_in_order(db_session, test_user):
+    conv = memory.get_or_create_conversation(db_session, test_user.id, None)
     memory.add_message(db_session, conv.id, MessageRole.USER, "hello")
     memory.add_message(db_session, conv.id, MessageRole.ASSISTANT, "hi there")
 
@@ -30,8 +43,8 @@ def test_messages_persist_and_are_retrievable_in_order(db_session):
     assert history[1].role == MessageRole.ASSISTANT
 
 
-def test_sync_issue_creates_new_issue_when_no_ref(db_session):
-    conv = memory.get_or_create_conversation(db_session, None)
+def test_sync_issue_creates_new_issue_when_no_ref(db_session, test_user):
+    conv = memory.get_or_create_conversation(db_session, test_user.id, None)
     extracted = ExtractedIssue(symptoms=["headache"], status="collecting")
 
     issue = memory.sync_issue(db_session, conv.id, extracted)
@@ -41,8 +54,8 @@ def test_sync_issue_creates_new_issue_when_no_ref(db_session):
     assert len(memory.get_open_issues(db_session, conv.id)) == 1
 
 
-def test_sync_issue_updates_existing_issue_by_ref_and_merges_fields(db_session):
-    conv = memory.get_or_create_conversation(db_session, None)
+def test_sync_issue_updates_existing_issue_by_ref_and_merges_fields(db_session, test_user):
+    conv = memory.get_or_create_conversation(db_session, test_user.id, None)
     first = memory.sync_issue(db_session, conv.id, ExtractedIssue(symptoms=["headache"], status="collecting"))
 
     updated = memory.sync_issue(
@@ -66,8 +79,8 @@ def test_sync_issue_updates_existing_issue_by_ref_and_merges_fields(db_session):
     assert len(memory.get_open_issues(db_session, conv.id)) == 1
 
 
-def test_two_unrelated_issue_extractions_create_two_issues(db_session):
-    conv = memory.get_or_create_conversation(db_session, None)
+def test_two_unrelated_issue_extractions_create_two_issues(db_session, test_user):
+    conv = memory.get_or_create_conversation(db_session, test_user.id, None)
     memory.sync_issue(db_session, conv.id, ExtractedIssue(symptoms=["headache"], status="collecting"))
     memory.sync_issue(db_session, conv.id, ExtractedIssue(symptoms=["ringing in ears"], status="collecting"))
 

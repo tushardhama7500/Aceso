@@ -12,6 +12,7 @@ The Agent only ever calls `generate_structured` / `generate_with_tools` on an
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -23,6 +24,7 @@ from app.config import Settings
 from app.models.ids import new_id
 from app.services.llm.base import LLMMessage, LLMProvider, LLMResult, ProviderError, Role, ToolDefinition, Usage
 from app.services.llm.gemini_provider import GeminiProvider
+from app.services.llm.groq_provider import GroqProvider
 from app.services.llm.openai_provider import OpenAIProvider
 from app.services.llm.openrouter_provider import OpenRouterProvider
 
@@ -51,13 +53,34 @@ class LLMOutputError(Exception):
 
 
 def build_provider(name: str, settings: Settings) -> LLMProvider:
+    if name == "groq":
+        return GroqProvider(api_key=settings.groq_api_key, model=settings.groq_model)
     if name == "gemini":
         return GeminiProvider(api_key=settings.gemini_api_key, model=settings.gemini_model)
     if name == "openrouter":
-        return OpenRouterProvider(api_key=settings.openrouter_api_key, model=settings.openrouter_model)
+        return OpenRouterProvider(api_key=settings.openrouter_api_key, model=settings.openrouter_models[0])
     if name == "openai":
         return OpenAIProvider(api_key=settings.openai_api_key, model=settings.openai_model)
     raise ValueError(f"Unknown LLM provider: {name}")
+
+
+def build_extra_providers(name: str, settings: Settings) -> list[LLMProvider]:
+    """Additional model variants for the same provider, tried in order after
+    the first configured model fails. Only OpenRouter supports a
+    comma-separated model list today (OPENROUTER_MODEL=model-a,model-b)."""
+    if name == "openrouter":
+        return [
+            OpenRouterProvider(api_key=settings.openrouter_api_key, model=model)
+            for model in settings.openrouter_models[1:]
+        ]
+    return []
+
+
+async def _backoff_sleep(seconds: float) -> None:
+    """Isolated so tests can mock just the retry backoff without touching
+    `asyncio.sleep` globally, which providers/fakes may also rely on (e.g.
+    to simulate a hang for timeout tests)."""
+    await asyncio.sleep(seconds)
 
 
 def _strip_json_fence(text: str) -> str:
@@ -76,55 +99,89 @@ class LLMService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.primary_name = settings.llm_provider
-        self.fallback_name = (
-            settings.llm_fallback_provider if settings.llm_fallback_provider != settings.llm_provider else None
-        )
+        # Ordered list of fallback provider names, e.g. ["gemini", "openrouter"]
+        # — tried in order after the primary. Deduplicated and never
+        # includes the primary itself, preserving configured order.
+        seen = {self.primary_name}
+        self.fallback_names: list[str] = []
+        for name in settings.fallback_provider_names:
+            if name not in seen:
+                seen.add(name)
+                self.fallback_names.append(name)
+
         self._providers: dict[str, LLMProvider] = {}
-        for name in {n for n in (self.primary_name, self.fallback_name) if n}:
+        self._extra_providers: dict[str, list[LLMProvider]] = {}
+        for name in {self.primary_name, *self.fallback_names}:
             self._providers[name] = build_provider(name, settings)
+            self._extra_providers[name] = build_extra_providers(name, settings)
+
+    def _candidates(self, provider_name: str) -> list[LLMProvider]:
+        first = self._providers.get(provider_name)
+        if first is None:
+            return []
+        # getattr guards test doubles that construct LLMService via
+        # __new__ and only ever set `_providers` directly.
+        extra = getattr(self, "_extra_providers", {}).get(provider_name, [])
+        return [first, *extra]
 
     # ------------------------------------------------------------------
     # Core: bounded retry + fallback, applied uniformly to any provider method
     # ------------------------------------------------------------------
     async def _call_with_fallback(self, method: str, *args, **kwargs) -> tuple[LLMResult, LLMCallMeta]:
         request_id = new_id("req")
-        plan = [(self.primary_name, False)]
-        if self.fallback_name:
-            plan.append((self.fallback_name, True))
+        plan = [(self.primary_name, False)] + [(name, True) for name in self.fallback_names]
+
+        timeout = self.settings.llm_timeout_seconds
+        backoff = self.settings.llm_retry_backoff_seconds
 
         last_error: Optional[Exception] = None
         for provider_name, is_fallback in plan:
-            provider = self._providers.get(provider_name)
-            if provider is None:
-                continue
-            attempts = 1 if is_fallback else 2  # one retry on primary, single shot on fallback -> bounded
-            for attempt in range(attempts):
-                start = time.perf_counter()
-                try:
-                    result: LLMResult = await getattr(provider, method)(*args, **kwargs)
-                except ProviderError as e:
-                    last_error = e
+            candidates = self._candidates(provider_name)
+            # One retry on primary, single shot on fallback -> bounded latency.
+            attempts = 1 if is_fallback else 2
+
+            for provider in candidates:
+                for attempt in range(attempts):
+                    start = time.perf_counter()
+                    retryable = True
+                    try:
+                        result: LLMResult = await asyncio.wait_for(
+                            getattr(provider, method)(*args, **kwargs), timeout=timeout
+                        )
+                    except asyncio.TimeoutError:
+                        last_error = ProviderError(f"{provider_name}/{provider.model} timed out after {timeout}s")
+                        retryable = True
+                    except ProviderError as e:
+                        last_error = e
+                        retryable = e.retryable
+                    else:
+                        latency_ms = (time.perf_counter() - start) * 1000
+                        meta = LLMCallMeta(
+                            request_id=request_id,
+                            provider=provider_name,
+                            model=provider.model,
+                            usage=result.usage,
+                            ttft_ms=result.ttft_ms,
+                            latency_ms=latency_ms,
+                            fallback_used=is_fallback,
+                            fallback_from=self.primary_name if is_fallback else None,
+                        )
+                        logger.info("llm_call %s", json.dumps(meta.model_dump()))
+                        return result, meta
+
                     logger.warning(
-                        "llm_call_failed provider=%s attempt=%d/%d error=%s",
+                        "llm_call_failed provider=%s model=%s attempt=%d/%d retryable=%s error=%s",
                         provider_name,
+                        provider.model,
                         attempt + 1,
                         attempts,
-                        e,
+                        retryable,
+                        last_error,
                     )
-                    continue
-                latency_ms = (time.perf_counter() - start) * 1000
-                meta = LLMCallMeta(
-                    request_id=request_id,
-                    provider=provider_name,
-                    model=provider.model,
-                    usage=result.usage,
-                    ttft_ms=result.ttft_ms,
-                    latency_ms=latency_ms,
-                    fallback_used=is_fallback,
-                    fallback_from=self.primary_name if is_fallback else None,
-                )
-                logger.info("llm_call %s", json.dumps(meta.model_dump()))
-                return result, meta
+                    if retryable and attempt + 1 < attempts:
+                        await _backoff_sleep(backoff)
+                        continue
+                    break  # exhausted or non-retryable -> next model/provider, no wasted wait
 
         raise LLMUnavailableError(f"All LLM providers failed: {last_error}")
 

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import appointments, chat, health, metrics
+from app.api import appointments, auth, chat, conversations, health, metrics
 from app.config import get_settings
 from app.db import init_db
 
@@ -40,6 +40,13 @@ app.add_middleware(
 )
 
 app.include_router(health.router)
+app.include_router(auth.router)
 app.include_router(chat.router)
+app.include_router(conversations.router)
 app.include_router(appointments.router)
 app.include_router(metrics.router)
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

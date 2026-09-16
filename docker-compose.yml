@@ -7,7 +7,12 @@ services:
       POSTGRES_PASSWORD: aceso
       POSTGRES_DB: aceso
     ports:
-      - "5432:5432"
+      # Host-side port only — 5432 is deliberately not published as-is
+      # because a local (non-Docker) Postgres install commonly already
+      # owns it on the host. Containers still reach this service on the
+      # internal Docker network as `postgres:5432` regardless of this
+      # mapping (see backend's DATABASE_URL below).
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -25,12 +30,22 @@ services:
       - path: .env
         required: false
     environment:
+      # Always the Docker service hostname, never localhost/127.0.0.1 —
+      # overrides whatever DATABASE_URL a loaded .env sets, so a .env
+      # written for non-Docker local dev can't accidentally point the
+      # containerized backend at a host-only Postgres instance.
       DATABASE_URL: postgresql+psycopg2://aceso:aceso@postgres:5432/aceso
     ports:
       - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   frontend:
     build:
@@ -38,11 +53,16 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
+      # Consumed by the BROWSER (Vite dev server just forwards it via
+      # import.meta.env), not by the frontend container itself — so this
+      # is correctly the host-published backend port, not a container-to
+      # -container hostname like `http://backend:8000`.
       VITE_API_BASE_URL: http://localhost:8000
     ports:
       - "5173:5173"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   pgdata:

@@ -8,6 +8,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any, Optional
 
+import openai
 from openai import AsyncOpenAI
 
 from app.services.llm.base import (
@@ -21,6 +22,19 @@ from app.services.llm.base import (
     ToolDefinition,
     Usage,
 )
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """429 (rate limit/quota) and 401/403 (auth) will fail identically on a
+    retry, so they're not worth one. Timeouts, connection errors, and 5xx
+    are transient — worth a quick retry or the next candidate."""
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+        return True
+    if isinstance(exc, (openai.RateLimitError, openai.AuthenticationError, openai.PermissionDeniedError)):
+        return False
+    if isinstance(exc, openai.APIStatusError):
+        return exc.status_code >= 500
+    return True
 
 
 def _to_openai_messages(messages: list[LLMMessage]) -> list[dict[str, Any]]:
@@ -52,7 +66,24 @@ class OpenAICompatibleProvider(LLMProvider):
     def __init__(self, *, name: str, api_key: str, model: str, base_url: Optional[str] = None):
         self.name = name
         self.model = model
-        self.client = AsyncOpenAI(api_key=api_key or "unset", base_url=base_url)
+        # max_retries=0: LLMService already owns retry/backoff/fallback.
+        # The SDK's own default retry (2 attempts, sleeping for however long
+        # the server's Retry-After says — Groq/OpenRouter can ask for 10-20s
+        # on a 429) runs INSIDE our asyncio.wait_for(LLM_TIMEOUT_SECONDS),
+        # so it can silently eat the whole timeout budget and turn a fast,
+        # correctly-classified 429 (retryable=False, instant fallback) into
+        # a slow, misclassified timeout (retryable=True) instead.
+        self.client = AsyncOpenAI(api_key=api_key or "unset", base_url=base_url, max_retries=0)
+
+    def _require_choice(self, resp):
+        # Some providers (notably OpenRouter, on overloaded/rate-limited free
+        # models) return HTTP 200 with an `error` body instead of `choices`.
+        # The SDK doesn't raise for that, so check explicitly.
+        if not getattr(resp, "choices", None):
+            error = getattr(resp, "error", None)
+            detail = error.get("message") if isinstance(error, dict) else error
+            raise ProviderError(f"{self.name} returned no choices: {detail or resp}", retryable=True)
+        return resp.choices[0]
 
     def _usage(self, resp_usage) -> Usage:
         if resp_usage is None:
@@ -98,9 +129,9 @@ class OpenAICompatibleProvider(LLMProvider):
             else:
                 resp = await self.client.chat.completions.create(**kwargs)
         except Exception as e:  # noqa: BLE001
-            raise ProviderError(f"{self.name} generate failed: {e}") from e
+            raise ProviderError(f"{self.name} generate failed: {e}", retryable=_is_retryable(e)) from e
 
-        choice = resp.choices[0]
+        choice = self._require_choice(resp)
         return LLMResult(
             content=choice.message.content,
             usage=self._usage(resp.usage),
@@ -130,9 +161,9 @@ class OpenAICompatibleProvider(LLMProvider):
                 max_tokens=max_tokens,
             )
         except Exception as e:  # noqa: BLE001
-            raise ProviderError(f"{self.name} generate_with_tools failed: {e}") from e
+            raise ProviderError(f"{self.name} generate_with_tools failed: {e}", retryable=_is_retryable(e)) from e
 
-        choice = resp.choices[0]
+        choice = self._require_choice(resp)
         tool_calls = []
         for tc in choice.message.tool_calls or []:
             try:
@@ -165,7 +196,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 stream_options={"include_usage": True},
             )
         except Exception as e:  # noqa: BLE001
-            raise ProviderError(f"{self.name} generate_stream failed: {e}") from e
+            raise ProviderError(f"{self.name} generate_stream failed: {e}", retryable=_is_retryable(e)) from e
 
         async for chunk in stream:
             if not chunk.choices:

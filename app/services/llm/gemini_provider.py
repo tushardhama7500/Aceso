@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Optional
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from app.services.llm.base import (
@@ -43,7 +44,28 @@ def _split_system_and_contents(messages: list[LLMMessage]) -> tuple[Optional[str
             contents.append(types.Content(role=role, parts=[types.Part.from_text(text=m.content)]))
 
     system_instruction = "\n\n".join(system_parts) if system_parts else None
+
+    if not contents and system_instruction:
+        # Gemini requires at least one content turn — unlike OpenAI-compatible
+        # APIs, a system-instruction-only message list is rejected outright.
+        contents = [types.Content(role="user", parts=[types.Part.from_text(text=system_instruction)])]
+        system_instruction = None
+
     return system_instruction, contents
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """429 (quota) and 401/403 (auth) will fail identically on a retry, so
+    they're not worth one. 5xx and anything unrecognized (timeouts,
+    connection errors) are treated as transient."""
+    if isinstance(exc, genai_errors.APIError):
+        code = exc.code or 0
+        if code in (401, 403, 429):
+            return False
+        if 400 <= code < 500:
+            return False
+        return True
+    return True
 
 
 def _usage(resp) -> Usage:
@@ -85,7 +107,7 @@ class GeminiProvider(LLMProvider):
         try:
             resp = await self.client.aio.models.generate_content(model=self.model, contents=contents, config=config)
         except Exception as e:  # noqa: BLE001
-            raise ProviderError(f"gemini generate failed: {e}") from e
+            raise ProviderError(f"gemini generate failed: {e}", retryable=_is_retryable(e)) from e
 
         finish_reason = None
         if resp.candidates:
@@ -117,7 +139,7 @@ class GeminiProvider(LLMProvider):
         try:
             resp = await self.client.aio.models.generate_content(model=self.model, contents=contents, config=config)
         except Exception as e:  # noqa: BLE001
-            raise ProviderError(f"gemini generate_with_tools failed: {e}") from e
+            raise ProviderError(f"gemini generate_with_tools failed: {e}", retryable=_is_retryable(e)) from e
 
         tool_calls = [
             ToolCall(id=f"call_{i}", name=fc.name, arguments=dict(fc.args or {}))
@@ -141,7 +163,7 @@ class GeminiProvider(LLMProvider):
                 model=self.model, contents=contents, config=config
             )
         except Exception as e:  # noqa: BLE001
-            raise ProviderError(f"gemini generate_stream failed: {e}") from e
+            raise ProviderError(f"gemini generate_stream failed: {e}", retryable=_is_retryable(e)) from e
 
         last_usage: Optional[Usage] = None
         async for chunk in stream:

@@ -19,14 +19,14 @@ from tests.fakes import FakeProvider
 
 
 @pytest.mark.asyncio
-async def test_two_unrelated_issues_produce_two_appointments(db_session, monkeypatch):
+async def test_two_unrelated_issues_produce_two_appointments(db_session, monkeypatch, test_user):
     provider = FakeProvider(name="gemini")
     svc = LLMService.__new__(LLMService)
     from app.config import Settings
 
-    svc.settings = Settings(llm_provider="gemini", llm_fallback_provider=None)
+    svc.settings = Settings(llm_provider="gemini", llm_fallback_providers="")
     svc.primary_name = "gemini"
-    svc.fallback_name = None
+    svc.fallback_names = []
     svc._providers = {"gemini": provider}
     agent = Agent(svc)
 
@@ -53,7 +53,7 @@ async def test_two_unrelated_issues_produce_two_appointments(db_session, monkeyp
             )
         )
     ]
-    conv_id, reply = await agent.process(db_session, None, "I've been having recurring headaches.")
+    conv_id, reply = await agent.process(db_session, test_user.id, None, "I've been having recurring headaches.")
     assert "how long" in reply.lower()
 
     issues = db_session.query(Issue).filter(Issue.conversation_id == conv_id).all()
@@ -93,7 +93,7 @@ async def test_two_unrelated_issues_produce_two_appointments(db_session, monkeyp
         LLMResult(content="Your Neurology appointment has been booked for 2026-09-20."),
     ]
     conv_id, reply = await agent.process(
-        db_session, conv_id, "Around two weeks, several times a week. I'm John Doe, September 20 works."
+        db_session, test_user.id, conv_id, "Around two weeks, several times a week. I'm John Doe, September 20 works."
     )
     assert "neurology" in reply.lower()
 
@@ -136,7 +136,7 @@ async def test_two_unrelated_issues_produce_two_appointments(db_session, monkeyp
         LLMResult(content="Your ENT appointment has been booked for 2026-09-22."),
     ]
     conv_id, reply = await agent.process(
-        db_session, conv_id, "I also have ringing in my ears for the past 3 days. September 22 please."
+        db_session, test_user.id, conv_id, "I also have ringing in my ears for the past 3 days. September 22 please."
     )
     assert "ent" in reply.lower()
 
@@ -156,21 +156,21 @@ async def test_two_unrelated_issues_produce_two_appointments(db_session, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_conversation_memory_persists_across_calls(db_session):
+async def test_conversation_memory_persists_across_calls(db_session, test_user):
     provider = FakeProvider(name="gemini")
     from app.config import Settings
 
     svc = LLMService.__new__(LLMService)
-    svc.settings = Settings(llm_provider="gemini", llm_fallback_provider=None)
+    svc.settings = Settings(llm_provider="gemini", llm_fallback_providers="")
     svc.primary_name = "gemini"
-    svc.fallback_name = None
+    svc.fallback_names = []
     svc._providers = {"gemini": provider}
     agent = Agent(svc)
 
     provider.responses = [
         LLMResult(content=json.dumps({"issues": [], "reply": "Hi, how can I help?", "patient_name": None}))
     ]
-    conv_id, _ = await agent.process(db_session, None, "hello")
+    conv_id, _ = await agent.process(db_session, test_user.id, None, "hello")
 
     from app.services import memory
 

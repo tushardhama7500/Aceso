@@ -19,8 +19,12 @@ This is a 2-day take-home assignment for SixHats. The brief asked for strong LLM
 - [Memory](#memory)
 - [Multi-issue handling](#multi-issue-handling)
 - [Doctor-facing summary](#doctor-facing-summary)
+- [Authentication & user data isolation](#authentication--user-data-isolation)
+- [Appointment ownership & duplicate protection](#appointment-ownership--duplicate-protection)
+- [Email notifications](#email-notifications)
 - [Guardrails](#guardrails)
 - [Observability](#observability)
+- [Security considerations](#security-considerations)
 - [Configuration](#configuration)
 - [Running locally](#running-locally)
 - [Testing](#testing)
@@ -35,45 +39,51 @@ This is a 2-day take-home assignment for SixHats. The brief asked for strong LLM
 ```mermaid
 flowchart TB
     subgraph Client
-        FE["React chat UI\n(frontend/)"]
+        FE["React chat UI\n(frontend/) — JWT in localStorage"]
     end
 
     subgraph Backend["FastAPI backend"]
+        Auth["/auth/register /auth/login\n(bcrypt + JWT)"]
+        CurrentUser["get_current_user\n(JWT dependency)"]
         API["Thin API routes\n/chat /appointments /metrics /health"]
         Agent["Agent (orchestrator)\napp/services/agent.py"]
         Guardrails["Guardrails\nPII · injection · emergency"]
-        Memory["Memory\nconversations · messages · issues"]
+        Memory["Memory\nconversations (user-owned) · messages · issues"]
         ToolReg["create_appointment tool"]
         Summary["Summary service\n(deterministic, from Issue fields)"]
         Obs["Observability\nstructured logs + /metrics"]
         LLMService["LLM Service\nfallback · structured output · tool calling"]
+        ApptSvc["AppointmentService\natomic booking + dedup"]
+        EmailSvc["EmailService\n(best-effort, post-commit)"]
     end
 
     subgraph Providers["LLM Provider Interface"]
-        Gemini["Gemini\n(primary, free tier)"]
-        OpenRouter["OpenRouter\n(fallback, free models)"]
-        OpenAI["OpenAI\n(optional)"]
+        Groq["Groq (primary)"]
+        Gemini["Gemini (fallback)"]
+        OpenRouter["OpenRouter (fallback, multi-model)"]
     end
 
-    DB[(PostgreSQL)]
+    DB[(PostgreSQL\nusers · conversations · issues · appointments)]
+    SMTPServer[(SMTP server\ne.g. Gmail)]
 
-    FE -->|POST /chat| API --> Agent
+    FE -->|POST /auth/register, /auth/login| Auth --> DB
+    FE -->|Bearer token| API --> CurrentUser --> DB
+    API --> Agent
     Agent --> Guardrails
-    Agent --> Memory
+    Agent --> Memory --> DB
     Agent --> LLMService
-    Agent --> ToolReg
+    Agent --> ToolReg --> ApptSvc
+    API -->|POST /appointments| ApptSvc
     Agent --> Summary
-    Agent --> Obs
-    ToolReg -->|executes| DB
-    Memory --> DB
-    Obs --> DB
+    Agent --> Obs --> DB
+    ApptSvc --> DB
+    ApptSvc --> EmailSvc --> SMTPServer
+    LLMService --> Groq
     LLMService --> Gemini
     LLMService --> OpenRouter
-    LLMService --> OpenAI
-    FE -->|GET /appointments| API
 ```
 
-The Agent is the only thing that talks to `LLMService`. `LLMService` is the only thing that talks to a provider. Providers are the only thing that talk to Gemini/OpenRouter/OpenAI SDKs. Nothing skips a layer — that's what makes swapping providers, or unit-testing the agent with a fake provider, possible without touching business logic.
+The Agent is the only thing that talks to `LLMService`. `LLMService` is the only thing that talks to a provider. Providers are the only thing that talk to Groq/Gemini/OpenRouter SDKs. `AppointmentService` is the only thing that writes an `Appointment` row or talks to `EmailService`; `EmailService` is the only thing that talks to the SMTP server. Nothing skips a layer — that's what makes swapping providers, or unit-testing the agent with a fake provider, possible without touching business logic. Every request into the backend that isn't `/auth/*`, `/health`, or `/metrics` passes through `get_current_user` first — the Agent and `AppointmentService` are never reachable without a validated JWT resolving to a real user.
 
 ---
 
@@ -262,6 +272,100 @@ Because there's no generative step left in this path, there's no step that could
 
 ---
 
+## Authentication & user data isolation
+
+Every conversation, issue, and appointment now belongs to a `User`. There is no more anonymous/shared access — `POST /chat`, `GET /appointments`, and `POST /appointments` all require a valid JWT.
+
+**Registration** (`POST /auth/register`) validates the email (Pydantic `EmailStr`), enforces a unique email at both the application layer and the database's `UNIQUE` constraint (closing the check-then-insert race), hashes the password with `bcrypt` (a fresh salt per hash — never a stored plaintext password, never a stored raw hash the app can reverse), and returns a JWT immediately so registration doubles as first login.
+
+**Login** (`POST /auth/login`) verifies the password against the stored bcrypt hash and returns the same JWT shape.
+
+### JWT flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as FastAPI route
+    participant Dep as get_current_user
+    participant DB as PostgreSQL
+
+    C->>API: POST /auth/login {email, password}
+    API->>DB: authenticate_user (bcrypt.checkpw)
+    DB-->>API: User row
+    API-->>C: {access_token, user}
+
+    C->>API: POST /chat  (Authorization: Bearer <token>)
+    API->>Dep: get_current_user(credentials)
+    Dep->>Dep: jwt.decode(token, JWT_SECRET_KEY, JWT_ALGORITHM)
+    Dep->>DB: db.get(User, sub claim)
+    DB-->>Dep: User row (or None)
+    Dep-->>API: current_user
+    API-->>C: 401 if missing/invalid/expired token or unknown user id
+```
+
+The token's `sub` claim is the user's **id**, never the email — so rotating a user's email doesn't invalidate outstanding tokens, and nothing email-shaped ever needs parsing out of a token. `get_current_user` (`app/api/deps.py`) is a single reusable FastAPI dependency: it reads `Authorization: Bearer <token>` via `HTTPBearer`, decodes and validates the JWT (rejecting anything expired, tampered, signed with the wrong algorithm, or missing a `sub` claim), and re-resolves the user from Postgres on every request — so a deleted user's still-unexpired token stops working immediately, rather than only after its natural expiry.
+
+### Data isolation — the ownership chain
+
+There is no `X-User-ID` header, no trusting `patient_name`, and no trusting email as an authorization mechanism anywhere. Ownership is a single chain, enforced at the point each resource is reached:
+
+```
+User  <--  Conversation.user_id  <--  Issue.conversation_id  <--  Appointment (via Issue.appointment_id)
+```
+
+- **Conversations**: `Conversation.user_id` is a required (`NOT NULL`) foreign key. `memory.get_or_create_conversation(db, user_id, conversation_id)` checks ownership before returning an existing conversation — if `conversation_id` exists but belongs to a different user, it raises `ConversationAccessError`, which `POST /chat` turns into a **404** (not 403 — confirming that a conversation ID exists but belongs to someone else is itself an information leak, so the same response is returned whether the ID is unowned or simply doesn't exist).
+- **Issues**: no separate ownership column — reached only through their (already-checked) `Conversation`, and never exposed through a standalone API endpoint.
+- **Appointments**: no `user_id` column was added here — `Appointment` still has no direct link to `Conversation`/`User` (unchanged from the original schema), and ownership is resolved by joining through the existing `Issue.appointment_id` relationship instead:
+  `appointment_service.list_appointments_for_user` does `Appointment JOIN Issue ON Issue.appointment_id JOIN Conversation ON Conversation.id WHERE Conversation.user_id = :user_id`. `POST /appointments` (the direct booking endpoint — see below) now requires an `issue_id` and checks `issue.conversation.user_id == current_user.id` before booking, returning the same **404** on mismatch.
+
+`tests/test_data_isolation.py` exercises this directly: registering two users, booking an appointment for user A, and asserting user B gets an empty appointment list, a 404 on `POST /chat` against user A's `conversation_id`, and a 404 on `POST /appointments` against user A's `issue_id`.
+
+---
+
+## Appointment ownership & duplicate protection
+
+`appointment_service.book_issue_appointment` is now the single code path that links an `Issue` to an `Appointment` — used by both the Agent's `create_appointment` tool-call flow and the direct `POST /appointments` endpoint. It closes the race a plain "read `issue.appointment_id`, then write" check leaves open (a repeated tool call, a frontend retry, or a retried HTTP request arriving concurrently) by taking a row-level lock before deciding:
+
+```python
+locked_issue = db.execute(select(Issue).where(Issue.id == issue.id).with_for_update()).scalar_one()
+if locked_issue.appointment_id:
+    return existing_appointment, created=False   # already booked — don't duplicate
+# ... create the Appointment, link it, commit ...
+return appointment, created=True
+```
+
+`SELECT ... FOR UPDATE` serializes concurrent booking attempts for the *same* issue at the database level (Postgres; SQLite in tests has no real row locking, but the tests exercise the same-session sequential case, which is what actually matters there). `created=False` means "a concurrent attempt already booked this" — the caller returns the existing appointment's confirmation instead of creating a second one, and no email is sent for it.
+
+---
+
+## Email notifications
+
+Appointment confirmations are sent via SMTP, through a small `EmailService` abstraction (`app/services/email_service.py`) — plain stdlib `smtplib`/`email`, no extra dependency. Works with a Gmail account (using an [App Password](https://myaccount.google.com/apppasswords), not the real account password — Google requires 2-Step Verification to be enabled first) or any other SMTP account by pointing `SMTP_HOST`/`SMTP_PORT` elsewhere.
+
+```
+Agent (tool call) ──┐
+                     ├──> AppointmentService.book_issue_appointment ──> PostgreSQL (commit)
+POST /appointments ──┘                                                       │
+                                                                               ▼
+                                                                        EmailService
+                                                                               │
+                                                                               ▼
+                                                                        SMTP server
+```
+
+Two invariants, both enforced in `book_issue_appointment`:
+
+1. **The email is sent only after the appointment has already committed.** The DB write and the email send are not one transaction — there is nothing to "undo" on an email failure because the booking is already durable by the time email is attempted.
+2. **A failing (or even raising) `EmailService` can never affect the booking.** The send is wrapped in its own `try/except`; a failure is logged (`aceso.email` logger, `email_send_failed`/`email_confirmation_failed`) and swallowed. The API response is unaffected — the client still gets back a normal booking confirmation.
+
+The email is deliberately minimal: department, date, appointment ID, and the patient's name for a greeting — never the doctor-facing `doctor_summary` (chief concern, severity, symptoms) that appointment records carry. `tests/test_email_service.py` asserts none of those fields' key names can appear in the rendered HTML.
+
+The recipient is the **authenticated account's email** (`current_user.email` / `conversation.user.email`), not `patient_name` (which is free text the LLM extracted from conversation and isn't a validated address) and not any patient-supplied email (there is no such field in this design — see the note in [Security considerations](#security-considerations)).
+
+If `SMTP_USERNAME`/`SMTP_PASSWORD` aren't set, `EmailService.enabled` is `False` and sending is skipped with a log line (`email_skipped reason=smtp_not_configured`) rather than attempted — useful for local dev without setting up email, and exactly what this repo's own `.env` does out of the box.
+
+---
+
 ## Guardrails
 
 Three layers, all deterministic and applied **before** the LLM is called (`app/services/guardrails.py`):
@@ -312,31 +416,64 @@ as one structured log line (`app/services/llm/service.py`, logger `aceso.llm`) �
 
 ---
 
+## Security considerations
+
+This is a take-home project's authentication layer, not a production healthcare identity system — read it that way:
+
+- **Passwords**: hashed with `bcrypt` (fresh salt per hash), never logged, never returned in any API response (`UserPublic` has no password/hash field at all — not even a redacted one).
+- **JWT secret**: `JWT_SECRET_KEY` has no default — `app/core/security.py` raises `RuntimeError` immediately if it's empty, rather than silently signing tokens with a blank/predictable key. Generated fresh per environment, `.env`-only, never committed (`.gitignore` already excludes `.env`).
+- **Token transport**: `Authorization: Bearer <token>`, validated via `HTTPBearer` + `PyJWT` with an explicit algorithm allowlist (`HS256`/`HS384`/`HS512`) — a token claiming `alg: none` or an unexpected algorithm is rejected outright, not silently accepted.
+- **No refresh tokens / no logout-side revocation list**: a JWT is valid until it expires (`JWT_ACCESS_TOKEN_EXPIRE_MINUTES`, default 60) or the user row it names is deleted (`get_current_user` re-resolves the user from Postgres on every request, so a deleted account's token stops working immediately — but an *active* account's token can't be revoked early). A real deployment would want short-lived access tokens plus a refresh-token/rotation scheme, and likely a proper identity provider (Auth0, Clerk, AWS Cognito, etc.) rather than hand-rolled JWT issuance, depending on compliance requirements (HIPAA-adjacent deployments in particular would need a BAA-covered auth provider, audit logging, and MFA — all out of scope here).
+- **Frontend token storage**: the React app stores the JWT in `localStorage` (see `frontend/src/api.js`). That's readable by any script running on the page — acceptable for this take-home's scope, but a real deployment handling real patient data would prefer an `httpOnly` cookie (immune to XSS-driven token theft) plus CSRF protection, which requires a same-site backend/frontend deployment this project doesn't have.
+- **Email**: `SMTP_PASSWORD` is read from environment only, never logged (see `tests/test_email_service.py::test_password_never_appears_in_logs`), and the confirmation email is deliberately minimal — no clinical detail (chief concern, severity, symptoms) ever leaves the database via email. Use a Gmail **App Password**, never the real account password — it can be revoked independently without touching the account's main login.
+- **Enumeration resistance**: login failures for "wrong password" and "no such account" return the identical `401 Incorrect email or password`; cross-user resource access returns `404`, not `403`, in every case (conversation, issue, appointment) — never enough information to confirm a resource exists but belongs to someone else.
+
+---
+
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in what you have:
 
 ```env
-LLM_PROVIDER=gemini
-LLM_FALLBACK_PROVIDER=openrouter
+# --- LLM provider chain: primary, then fallbacks in order ---
+LLM_PROVIDER=groq
+LLM_FALLBACK_PROVIDERS=gemini,openrouter
 
-GEMINI_API_KEY=            # free at https://aistudio.google.com/apikey
+GROQ_API_KEY=               # https://console.groq.com/keys — very low latency
+GROQ_MODEL=openai/gpt-oss-120b
+
+GEMINI_API_KEY=              # free at https://aistudio.google.com/apikey
 GEMINI_MODEL=gemini-2.0-flash
 
-OPENROUTER_API_KEY=        # free at https://openrouter.ai
-OPENROUTER_MODEL=meta-llama/llama-3.3-70b-instruct:free
+OPENROUTER_API_KEY=          # free at https://openrouter.ai
+OPENROUTER_MODEL=model-a:free,model-b:free   # comma-separated — tried in order
 
-OPENAI_API_KEY=            # optional — the app works without this
+OPENAI_API_KEY=               # optional — the app works without this
 OPENAI_MODEL=gpt-4o-mini
 
 LLM_TEMPERATURE=0.2
 LLM_MAX_TOKENS=1000
 LLM_FREQUENCY_PENALTY=0
+LLM_TIMEOUT_SECONDS=6         # per-attempt ceiling before treating a hang as a retryable failure
+LLM_RETRY_BACKOFF_SECONDS=0.5 # pause before retrying the SAME provider/model on a transient error
+
+# --- Auth (JWT) ---
+JWT_SECRET_KEY=                # required — generate with e.g. `python -c "import secrets;print(secrets.token_urlsafe(48))"`
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60
+
+# --- Email (SMTP) — appointment confirmations only, best-effort ---
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USE_TLS=true
+SMTP_USERNAME=                  # leave blank (with SMTP_PASSWORD) to disable email
+SMTP_PASSWORD=                  # Gmail: an App Password, never your real password
+SMTP_FROM_EMAIL=                # defaults to SMTP_USERNAME if blank
 
 DATABASE_URL=postgresql+psycopg2://aceso:aceso@localhost:5432/aceso
 ```
 
-**Free-first, by construction**: `LLM_PROVIDER=gemini` + `LLM_FALLBACK_PROVIDER=openrouter` is the default, and both have usable free tiers. `OPENAI_API_KEY` is never required — `LLMService` only constructs providers that are actually referenced by `LLM_PROVIDER`/`LLM_FALLBACK_PROVIDER`, so leaving OpenAI unconfigured is not just supported, it means OpenAI code never even runs.
+**Free-first, by construction**: `LLM_PROVIDER`/`LLM_FALLBACK_PROVIDERS` only construct providers actually referenced — `OPENAI_API_KEY` is never required, and leaving it unconfigured means that provider's code never even runs. `JWT_SECRET_KEY` is the one required secret with no safe default: `app/core/security.py` raises immediately rather than signing tokens with a blank key. `SMTP_USERNAME`/`SMTP_PASSWORD` are optional — leaving them blank disables email sending (logged, not silently ignored) without affecting booking.
 
 `.env` is git-ignored; only `.env.example` (placeholders only) is committed.
 
@@ -344,26 +481,69 @@ DATABASE_URL=postgresql+psycopg2://aceso:aceso@localhost:5432/aceso
 
 ## Running locally
 
+**Prerequisites**: Docker Desktop (or Docker Engine + Compose v2) only — no local PostgreSQL, Python, or Node install is required.
+
 ```bash
 git clone <this repo>
 cd aceso
 cp .env.example .env
-# edit .env and add at least GEMINI_API_KEY (or OPENROUTER_API_KEY)
+# edit .env: add at least one LLM provider key, and set JWT_SECRET_KEY
+# (required — generate with: python -c "import secrets;print(secrets.token_urlsafe(48))")
 
 docker compose up --build
 ```
 
-This starts three containers — `postgres`, `backend` (FastAPI on `:8000`), `frontend` (Vite dev server on `:5173`). No local PostgreSQL, Python, or Node install is required. Open `http://localhost:5173` for the chat UI, or hit the API directly:
+This starts three containers:
+
+| Service | URL | Purpose |
+|---|---|---|
+| `frontend` | http://localhost:5173 | Vite dev server (React UI) |
+| `backend` | http://localhost:8000 | FastAPI (docs at `/docs`) |
+| `postgres` | `localhost:5433` → container `5432` | Database (published on **5433** on the host — see note below) |
+
+Open **http://localhost:5173** for the UI (register or log in first), or hit the API directly:
 
 ```bash
-curl -X POST http://localhost:8000/chat \
+curl -X POST http://localhost:8000/auth/register \
   -H "Content-Type: application/json" \
+  -d '{"email": "you@example.com", "password": "a-strong-password"}'
+# -> {"access_token": "...", "token_type": "bearer", "user": {...}}
+
+TOKEN=<paste access_token from above>
+
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
   -d '{"message": "I have ringing in my ears"}'
 
-curl http://localhost:8000/appointments
+curl http://localhost:8000/appointments -H "Authorization: Bearer $TOKEN"
 curl http://localhost:8000/metrics
 curl http://localhost:8000/health
 ```
+
+From PowerShell, the health check is:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/health
+# -> @{ status = ok; database = True }
+```
+
+**Database schema**: there's no Alembic — `init_db()` runs `Base.metadata.create_all()` in the backend's FastAPI `lifespan` on every startup, so a fresh `pgdata` volume gets its full schema (`users`, `conversations`, `messages`, `issues`, `appointments`, `llm_request_logs`) automatically; no separate migration step is needed. `depends_on: postgres: condition: service_healthy` on the `backend` service means Compose won't even start the backend container until Postgres's own healthcheck (`pg_isready`) passes, so there's no startup race to work around.
+
+**Stopping the application**:
+
+```bash
+docker compose down        # stop and remove containers, keep the postgres data volume
+docker compose down -v      # also delete the data volume — next `up` starts from a truly empty database
+```
+
+### Docker troubleshooting
+
+- **Postgres port 5433, not 5432**: `docker-compose.yml` publishes Postgres on host port **5433** (`"5433:5432"`), not the standard 5432. This is deliberate — a local, non-Docker Postgres install commonly already owns 5432 on the host, and that conflict makes `docker compose up` fail outright with a "port is already allocated" error. Containers still reach Postgres internally as `postgres:5432` regardless of this mapping (that's what `DATABASE_URL` inside the backend container uses) — only host-side tools (e.g. `psql` run directly on your machine) need the `5433` port. If you don't have a local Postgres, feel free to change this back to `"5432:5432"`.
+- **"port is already allocated" on 8000 or 5173**: something else on your machine (often a previous non-Docker `uvicorn`/`vite` run) is already bound to that port. Find and stop it (`netstat -ano | findstr :8000` on Windows, then `taskkill /F /PID <pid>`), or change the host-side port in `docker-compose.yml`.
+- **backend container unhealthy / restarting**: `docker compose logs backend` — almost always either Postgres wasn't reachable yet (shouldn't happen given the healthcheck-gated `depends_on`, but check `docker compose ps` to confirm `postgres` shows `healthy`) or a required env var is missing. The app itself starts fine with every LLM/JWT/SMTP key unset (secrets are read lazily and default to disabled), so a crash-looping backend is not caused by an unset provider key — check the actual traceback in the logs.
+- **Stale schema after pulling changes that add new columns/tables**: since there's no migration framework, `create_all()` only ever *adds* missing tables — it can't `ALTER TABLE` an existing one. If a pull adds a new required column to an existing table, run `docker compose down -v` (drops the data volume) and `docker compose up --build` again for a clean schema. This loses local data; there's nothing to preserve in a throwaway dev volume, but don't do this against a volume you actually care about.
+- **Frontend loads but chat/login calls fail**: open the browser console — CORS errors there usually mean `CORS_ORIGINS` in `.env` was narrowed away from the default `*`. Confirm with `curl -I -H "Origin: http://localhost:5173" http://localhost:8000/health` and check for `Access-Control-Allow-Origin` in the response.
+- **Rebuilding after a dependency change**: `docker compose build --no-cache <service>` — plain `docker compose up --build` reuses cached layers and can miss a `requirements.txt`/`package.json` change if the layer cache is stale.
 
 ### Running the backend without Docker (optional, for development)
 
@@ -384,30 +564,39 @@ pip install -r requirements.txt
 pytest
 ```
 
-43 tests, all offline — every LLM call is mocked through a scriptable `FakeProvider` (`tests/fakes.py`) that implements the exact same `LLMProvider` interface a real provider does, so **no test ever consumes real API quota**. Coverage:
+130 tests, all offline — every LLM call is mocked through a scriptable `FakeProvider` (`tests/fakes.py`) that implements the exact same `LLMProvider` interface a real provider does, so **no test ever consumes real API quota**, and every email test mocks `smtplib.SMTP` rather than sending real mail. Coverage:
 
 | File | Covers |
 |---|---|
-| `test_llm_providers.py` | Provider abstraction: fallback, bounded retry, structured-output parsing + one corrective retry, tool-call parsing |
+| `test_llm_providers.py` | Provider abstraction: multi-tier fallback, bounded retry with backoff, retryable/non-retryable error classification, per-attempt timeout, OpenRouter multi-model fallback |
+| `test_groq_provider.py` | Groq as primary provider: successful requests, tool calling, structured output, fallback chain wiring |
+| `test_llm_provider_wire_format.py` | Gemini/OpenAI-compatible wire-format edge cases and error classification against real SDK exception types |
 | `test_chat.py` | `POST /chat` end-to-end through FastAPI's `TestClient`: follow-up questions, department recommendation, tool-call-triggered booking |
 | `test_multi_appointment.py` | The assignment's critical end-to-end scenario: headache -> Neurology + ringing in ears -> ENT in one conversation, two separate appointments with two separate summaries; conversation memory persisting across calls |
-| `test_memory.py` | Conversation/message persistence, issue upsert-by-reference and field merging |
+| `test_memory.py` | Conversation/message persistence (now user-scoped), issue upsert-by-reference and field merging |
+| `test_conversation_memory.py` | Regression coverage for known-vs-missing field tracking across turns |
 | `test_tools.py` | `create_appointment` tool schema, argument validation, and that executing it actually writes a row |
 | `test_guardrails.py` | PII redaction (including the date/phone false-positive case), prompt-injection detection, emergency detection, and that both short-circuit *before* any LLM call |
+| `test_auth.py` | Registration, login, password hashing, JWT create/decode, and `get_current_user` rejecting missing/invalid/expired tokens or a deleted user |
+| `test_data_isolation.py` | Cross-user isolation: appointments, `/chat` against another user's `conversation_id`, `/appointments` against another user's `issue_id` — all 404, never a data leak |
+| `test_appointment_booking.py` | Atomic booking, duplicate-booking protection, and that a failing/raising `EmailService` never affects an already-persisted appointment |
+| `test_email_service.py` | SMTP message shape, minimal (non-medical) email content, and that the password never appears in logs |
 
 ---
 
 ## API reference
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/chat` | `{conversation_id?, message}` -> `{conversation_id, message}` |
-| `POST` | `/appointments` | `{patient_name, department, visit_date, summary}` -> `{appointment_id}` |
-| `GET` | `/appointments` | List all appointments |
-| `GET` | `/metrics` | Aggregate LLM usage/latency/fallback stats |
-| `GET` | `/health` | Liveness + DB connectivity |
+| Method | Path | Auth? | Purpose |
+|---|---|---|---|
+| `POST` | `/auth/register` | No | `{email, password}` -> `{access_token, token_type, user}` |
+| `POST` | `/auth/login` | No | `{email, password}` -> `{access_token, token_type, user}` |
+| `POST` | `/chat` | **Yes** | `{conversation_id?, message}` -> `{conversation_id, message}` — 404 if `conversation_id` belongs to another user |
+| `POST` | `/appointments` | **Yes** | `{issue_id, patient_name, department, visit_date, summary}` -> `{appointment_id}` — 404 if `issue_id` isn't owned by the caller |
+| `GET` | `/appointments` | **Yes** | List the caller's own appointments only |
+| `GET` | `/metrics` | No | Aggregate LLM usage/latency/fallback stats |
+| `GET` | `/health` | No | Liveness + DB connectivity |
 
-Interactive docs at `http://localhost:8000/docs` once running.
+Protected routes expect `Authorization: Bearer <token>` from `/auth/login` or `/auth/register`. Interactive docs at `http://localhost:8000/docs` once running.
 
 ---
 
@@ -416,8 +605,8 @@ Interactive docs at `http://localhost:8000/docs` once running.
 - **No RAG / vector database** — department recommendation is a reasoning task over a handful of categories, not a retrieval task over a large knowledge base. Adding one would add infrastructure without improving the actual behavior being tested here.
 - **No LangChain/LangGraph** — the orchestration needed (guardrails -> memory -> one structured call -> conditional tool call) is a few hundred lines of plain Python. A graph framework would add indirection without adding capability, and would obscure exactly the "clean agent/tool design" this assignment is meant to demonstrate.
 - **No Kafka/Redis/Kubernetes** — single-process FastAPI app, one Postgres instance. Nothing here has a queueing, caching, or horizontal-scaling problem to solve.
-- **No Alembic/migrations** — `metadata.create_all()` on startup. Fine for a single-environment take-home; would be the first thing added for a real deployment.
-- **No authentication** — out of scope for the assignment; every conversation is addressed purely by `conversation_id`.
+- **No Alembic/migrations** — `metadata.create_all()` on startup. Fine for a single-environment take-home; would be the first thing added for a real deployment. (This meant the auth schema change — adding `users` and `conversations.user_id` — required dropping and recreating the dev database rather than an `ALTER TABLE`; a real deployment with real data would need Alembic before this kind of change.)
+- **Hand-rolled JWT auth, not a full identity provider** — registration/login/JWT issuance is deliberately small (bcrypt + PyJWT, no OAuth, no SSO, no MFA, no refresh-token rotation). This is not production-grade healthcare authentication. A real deployment — especially anything HIPAA-adjacent — would want a dedicated identity provider (Auth0, Clerk, AWS Cognito, etc.) handling MFA, audit logging, session/refresh-token management, and compliance-relevant guarantees this hand-rolled layer doesn't attempt. See [Security considerations](#security-considerations).
 - **No production frontend build/polish** — the Vite dev server is what `docker compose up` runs; there's no separate Nginx/static-build stage. The brief was explicit that frontend polish doesn't matter here, so the effort went into the backend/agent/LLM layers instead.
 - **Doctor summary is deterministic, not a second LLM call** — see [Doctor-facing summary](#doctor-facing-summary). This trades a small amount of "look how much LLM we used" for a much stronger anti-hallucination guarantee, which felt like the right call for anything touching a doctor-facing medical record.
 - **No fuzzy/embedding-based issue de-duplication** — multi-issue matching relies on the LLM's own `issue_ref` bookkeeping (see [Multi-issue handling](#multi-issue-handling)) rather than a second matching system.

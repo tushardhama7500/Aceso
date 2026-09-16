@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class AppointmentCreateRequest(BaseModel):
+    issue_id: str = Field(..., description="Issue this appointment is for — must belong to the caller")
     patient_name: str = Field(..., min_length=1, max_length=255)
     department: str = Field(..., min_length=1, max_length=100)
     visit_date: dt.date
